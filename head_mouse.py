@@ -47,6 +47,7 @@ from Quartz import (
     kCVPixelFormatType_32BGRA,
 )
 from Foundation import NSData, NSObject
+from PIL import Image, ImageDraw, ImageFont
 import dispatch
 
 try:
@@ -59,6 +60,98 @@ except ImportError as exc:
 
 class BuiltInCameraNotFound(RuntimeError):
     """Raised rather than silently opening a Continuity/iPhone camera."""
+
+
+GUIDE_WINDOW_TITLE = "Head Mouse - Motion Guide"
+GUIDE_WIDTH = 480
+GUIDE_HEIGHT = 390
+
+
+def _guide_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Load a bundled macOS Korean font, with a safe Pillow fallback."""
+    candidates = (
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/NotoSansGothic-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+    )
+    for font_path in candidates:
+        try:
+            return ImageFont.truetype(font_path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def create_motion_guide() -> np.ndarray:
+    """Create the Korean quick-reference panel shown at the bottom-right."""
+    canvas = Image.new("RGB", (GUIDE_WIDTH, GUIDE_HEIGHT), (22, 25, 32))
+    draw = ImageDraw.Draw(canvas)
+    title_font = _guide_font(22)
+    label_font = _guide_font(16)
+    detail_font = _guide_font(15)
+    footer_font = _guide_font(14)
+
+    draw.rounded_rectangle((10, 10, GUIDE_WIDTH - 10, GUIDE_HEIGHT - 10),
+                           radius=18, fill=(29, 33, 42), outline=(73, 84, 105), width=2)
+    draw.text((24, 20), "얼굴 모션 빠른 안내", font=title_font, fill=(244, 247, 252))
+    draw.text((GUIDE_WIDTH - 137, 25), "HEAD MOUSE", font=footer_font,
+              fill=(102, 198, 255))
+    draw.line((24, 57, GUIDE_WIDTH - 24, 57), fill=(65, 74, 91), width=1)
+
+    motions = (
+        ("커서 이동", "고개를 원하는 방향으로 움직이기"),
+        ("좌클릭", "양쪽 눈을 빠르게 3번 깜빡이기"),
+        ("스크롤 모드", "입을 벌리고 0.7초 유지"),
+        ("스크롤", "모드에서 고개를 위·아래로 움직이기"),
+        ("드래그", "양쪽 눈썹을 0.5초 올려 켜기/끄기"),
+        ("음성 입력", "입 다문 넓은 미소를 2초 유지"),
+    )
+    row_top = 68
+    row_height = 42
+    for index, (label, detail) in enumerate(motions):
+        y = row_top + index * row_height
+        if index % 2 == 0:
+            draw.rounded_rectangle((20, y - 3, GUIDE_WIDTH - 20, y + 34),
+                                   radius=8, fill=(35, 40, 50))
+        draw.text((30, y + 4), label, font=label_font, fill=(104, 201, 255))
+        draw.text((150, y + 5), detail, font=detail_font, fill=(225, 230, 239))
+
+    footer_top = 326
+    draw.rounded_rectangle((20, footer_top, GUIDE_WIDTH - 20, GUIDE_HEIGHT - 20),
+                           radius=10, fill=(39, 47, 61))
+    draw.text((31, footer_top + 9), "H  안내 숨기기 / 다시 표시",
+              font=footer_font, fill=(255, 215, 110))
+    draw.text((273, footer_top + 9), "C  보정   Q  종료",
+              font=footer_font, fill=(190, 199, 214))
+    draw.text((31, footer_top + 31), "키 입력 전 미리보기 또는 안내 창을 클릭하세요.",
+              font=footer_font, fill=(155, 166, 184))
+    return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
+
+
+def show_motion_guide(guide_image: np.ndarray, screen_width: int,
+                      screen_height: int) -> None:
+    cv2.namedWindow(GUIDE_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
+    cv2.imshow(GUIDE_WINDOW_TITLE, guide_image)
+    cv2.moveWindow(
+        GUIDE_WINDOW_TITLE,
+        max(20, screen_width - GUIDE_WIDTH - 20),
+        max(20, screen_height - GUIDE_HEIGHT - 70),
+    )
+    topmost_property = getattr(cv2, "WND_PROP_TOPMOST", None)
+    if topmost_property is not None:
+        try:
+            cv2.setWindowProperty(GUIDE_WINDOW_TITLE, topmost_property, 1)
+        except cv2.error:
+            # Some OpenCV macOS builds do not expose the topmost window flag.
+            pass
+
+
+def hide_motion_guide() -> None:
+    try:
+        cv2.destroyWindow(GUIDE_WINDOW_TITLE)
+    except cv2.error:
+        # The user may already have closed the guide with the window button.
+        pass
 
 
 def find_builtin_camera():
@@ -164,6 +257,7 @@ class FaceGestureFrame:
     left_eye: float
     right_eye: float
     mouth_roundness: float
+    mouth_opening: float
     mouth_width: float
     left_brow_gap: float
     right_brow_gap: float
@@ -225,11 +319,12 @@ class VisionGestureAnalyzer:
         left_eye = _region_points(landmarks.leftEye())
         right_eye = _region_points(landmarks.rightEye())
         outer_lips = _region_points(landmarks.outerLips())
+        inner_lips = _region_points(landmarks.innerLips())
         nose = _region_points(landmarks.nose())
         left_brow = _region_points(landmarks.leftEyebrow())
         right_brow = _region_points(landmarks.rightEyebrow())
         if any(region is None for region in (
-            left_eye, right_eye, outer_lips, nose, left_brow, right_brow
+            left_eye, right_eye, outer_lips, inner_lips, nose, left_brow, right_brow
         )):
             return None
 
@@ -265,6 +360,7 @@ class VisionGestureAnalyzer:
             left_eye=_shape_ratio(left_eye),
             right_eye=_shape_ratio(right_eye),
             mouth_roundness=_shape_ratio(outer_lips),
+            mouth_opening=float(np.ptp(inner_lips[:, 1])),
             mouth_width=float(np.ptp(outer_lips[:, 0])),
             left_brow_gap=float(left_brow[:, 1].mean() - left_eye[:, 1].mean()),
             right_brow_gap=float(right_brow[:, 1].mean() - right_eye[:, 1].mean()),
@@ -515,8 +611,9 @@ class GestureController:
         if len(self.samples) < self.CALIBRATION_FRAMES:
             return False
         values = np.array([
-            [sample.left_eye, sample.right_eye, sample.mouth_roundness, sample.mouth_width,
-             sample.left_brow_gap, sample.right_brow_gap]
+            [sample.left_eye, sample.right_eye, sample.mouth_roundness,
+             sample.mouth_opening, sample.mouth_width, sample.left_brow_gap,
+             sample.right_brow_gap]
             for sample in self.samples
         ])
         self.baseline = np.median(values, axis=0)
@@ -547,8 +644,8 @@ class GestureController:
         self.face_missing_since = None
         if not self._learn_baseline(frame):
             return []
-        (left_eye_base, right_eye_base, mouth_base, mouth_width_base,
-         left_brow_base, right_brow_base) = self.baseline
+        (left_eye_base, right_eye_base, mouth_base, mouth_opening_base,
+         mouth_width_base, left_brow_base, right_brow_base) = self.baseline
         left_eye_level = frame.left_eye / max(left_eye_base, 1e-6)
         right_eye_level = frame.right_eye / max(right_eye_base, 1e-6)
         average_eye_level = (left_eye_level + right_eye_level) / 2.0
@@ -560,10 +657,19 @@ class GestureController:
             and average_eye_level < 0.65
         )
         both_open = min(left_eye_level, right_eye_level) > 0.82
-        mouth_o = frame.mouth_roundness > max(0.44, mouth_base * 1.65)
         wide_smile = (
             frame.mouth_width > mouth_width_base * 1.12
             and frame.mouth_roundness < max(0.42, mouth_base * 1.30)
+        )
+        # The inner-lip vertical gap detects an ordinarily opened mouth without
+        # requiring the lips to form a round O. Excluding a wide smile keeps the
+        # voice gesture separate from the scroll-mode gesture.
+        mouth_open = (
+            frame.mouth_opening > max(
+                mouth_opening_base * 1.65,
+                mouth_opening_base + 0.035,
+            )
+            and not wide_smile
         )
         brows_up = (
             frame.left_brow_gap > left_brow_base + 0.035
@@ -581,7 +687,7 @@ class GestureController:
             events.append("VOICE START")
             return events
 
-        if self.mouth_hold.update(mouth_o, now):
+        if self.mouth_hold.update(mouth_open, now):
             self.scroll_mode = not self.scroll_mode
             self.scroll_anchor_y = frame.face_center[1]
             self.scroll_remainder = 0.0
@@ -743,6 +849,8 @@ def parse_args() -> argparse.Namespace:
                         help="0~1 사이의 속도 반응값; 높을수록 빠르게 반응 (기본값: 0.75)")
     parser.add_argument("--language", default="ko-KR",
                         help="음성 인식 언어 코드 (기본값: ko-KR)")
+    parser.add_argument("--hide-guide", action="store_true",
+                        help="시작할 때 우측 하단 모션 안내를 숨김")
     return parser.parse_args()
 
 
@@ -782,20 +890,24 @@ def main() -> int:
     event_text = ""
     event_display_until = 0.0
     last_gesture_frame: Optional[FaceGestureFrame] = None
-    preview_title = "Head Mouse - C: calibrate, Q: quit"
+    preview_title = "Head Mouse - C: calibrate, H: guide, Q: quit"
     preview_width, preview_height = 320, 240
     cv2.namedWindow(preview_title, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(preview_title, preview_width, preview_height)
     # OpenCV uses the same top-left screen coordinate convention as pyautogui.
     cv2.moveWindow(preview_title, 20, max(20, screen_height - preview_height - 70))
+    guide_image = create_motion_guide()
+    guide_visible = not args.hide_guide
+    if guide_visible:
+        show_motion_guide(guide_image, screen_width, screen_height)
     print(f"사용 카메라: {camera.name} (MacBook 내장 카메라 전용)")
     print("양쪽 눈을 빠르게 세 번 깜빡임: 좌클릭")
-    print("O 입 0.7초: 스크롤 모드 | 양쪽 눈썹 0.5초: 드래그 토글")
+    print("입 벌리기 0.7초: 스크롤 모드 | 양쪽 눈썹 0.5초: 드래그 토글")
     print("넓게 미소 짓기 2초: 음성 입력 시작")
     permission_message = voice.permission_message()
     if permission_message:
         print(f"음성 입력 권한: {permission_message}")
-    print("C: 보정 | Q 또는 Esc: 종료")
+    print("H: 모션 안내 켜기/끄기 | C: 보정 | Q 또는 Esc: 종료")
     camera.start()
     try:
         while True:
@@ -822,7 +934,15 @@ def main() -> int:
             if gesture_frame is not None:
                 last_gesture_frame = gesture_frame
                 was_scroll_mode = gestures.scroll_mode
-                events = [] if voice.listening else gestures.update(gesture_frame, now)
+                if voice.listening:
+                    # Dictation takes exclusive control of facial gestures.
+                    # Speaking can open the mouth, so keep scroll mode off and
+                    # do not run any click, drag, or scroll gesture detectors.
+                    gestures.scroll_mode = False
+                    gestures.scroll_anchor_y = None
+                    events = []
+                else:
+                    events = gestures.update(gesture_frame, now)
                 if "VOICE START" in events:
                     started, message = voice.start()
                     if started:
@@ -896,6 +1016,14 @@ def main() -> int:
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
+            if key in (ord("h"), ord("H")):
+                guide_visible = not guide_visible
+                if guide_visible:
+                    show_motion_guide(guide_image, screen_width, screen_height)
+                    print("모션 안내 표시")
+                else:
+                    hide_motion_guide()
+                    print("모션 안내 숨김")
             if key in (ord("c"), ord("C")) and last_gesture_frame is not None:
                 voice.cancel()
                 controller.calibrate(last_gesture_frame.control_point)
@@ -905,6 +1033,7 @@ def main() -> int:
         voice.cancel()
         gestures.release_drag("프로그램 종료")
         camera.close()
+        hide_motion_guide()
         cv2.destroyAllWindows()
     return 0
 
