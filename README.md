@@ -1,0 +1,91 @@
+# Head Mouse for Mac
+
+MacBook의 **내장 웹캠만** 사용해 얼굴 움직임과 표정으로 마우스를 제어하는 Python 프로그램입니다. iPhone 연속성 카메라는 카메라 후보에서 제외합니다. 얼굴 랜드마크는 macOS 내장 Vision 프레임워크로 분석하므로 MediaPipe나 별도 AI 모델 파일이 필요하지 않습니다.
+
+## 설치
+
+```bash
+cd /Users/igyeongmin/Desktop/eyetracker
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+OpenCV 5.x와의 호환 문제를 피하려면 아래 명령으로 4.x 버전을 설치하세요.
+
+```bash
+python3 -m pip install --upgrade --force-reinstall "opencv-python>=4.9,<5"
+```
+
+이미 일부 패키지를 개별 설치했다면, `dispatch` 모듈까지 포함되도록 다음 명령을 한 번 실행하세요.
+
+```bash
+python3 -m pip install -U pyobjc-framework-AVFoundation pyobjc-framework-libdispatch pyobjc-framework-Quartz pyobjc-framework-Vision
+```
+
+## 실행
+
+```bash
+python head_mouse.py
+```
+
+처음 실행하면 macOS가 다음 권한을 요청합니다.
+
+1. **카메라**: Terminal 또는 사용하는 IDE에 허용
+2. **손쉬운 사용(Accessibility)**: 커서 이동을 위해 Terminal 또는 사용하는 IDE에 허용
+3. **마이크**: 음성 입력을 위해 `Head Mouse Voice`에 허용
+4. **음성 인식**: 음성을 텍스트로 변환하기 위해 `Head Mouse Voice`에 허용
+
+권한 위치: `시스템 설정 → 개인정보 보호 및 보안 → 카메라 / 손쉬운 사용 / 마이크 / 음성 인식`
+
+## 조작법
+
+- 얼굴을 화면 중앙에 둔 상태에서 `C`: 현재 얼굴 위치를 기준점으로 보정
+- 양쪽 눈을 빠르게 세 번 깜빡이기: 좌클릭
+- 입을 `O` 모양으로 0.7초 유지: 스크롤 모드 켜기/끄기
+- 스크롤 모드에서 고개를 위·아래로 이동: 위·아래 스크롤
+- 양쪽 눈썹을 0.5초 올리기: 좌클릭 누르기/놓기 토글
+- 넓게 미소 짓기를 2초 유지: 한국어 음성 입력 시작
+- `Q` 또는 `Esc`: 종료
+- 카메라 미리보기 창을 클릭한 뒤 키를 누르세요.
+
+시작하거나 `C`를 누른 직후에는 약 24프레임 동안 정면을 보고 자연스러운 표정을 유지하세요. 눈 뜬 정도, 평상시 입 모양, 눈썹 위치를 사용자 얼굴에 맞게 자동 보정합니다.
+
+드래그 중에는 미리보기 테두리가 빨간색으로 표시됩니다. 얼굴을 1초 이상 인식하지 못하거나 프로그램을 종료하면 안전을 위해 좌클릭 누르기 상태가 자동 해제됩니다.
+
+## 음성으로 검색어 입력
+
+1. 얼굴 마우스로 웹사이트 검색창을 좌클릭합니다.
+2. 넓게 미소 짓기를 2초 유지합니다.
+3. 미리보기에 `LISTENING...`이 표시되면 검색어를 말합니다.
+4. 약 1.5초 동안 말이 없으면 인식을 종료하고 현재 포커스된 검색창에 텍스트를 입력합니다.
+
+기본 언어는 한국어입니다. 다른 언어를 사용하려면 실행 옵션으로 언어 코드를 지정하세요.
+
+```bash
+python head_mouse.py --language en-US
+```
+
+인식 결과는 클립보드를 거치지 않고 macOS 유니코드 키보드 이벤트로 입력됩니다. 언어 및 시스템 설정에 따라 Apple 음성 인식 서비스가 인터넷 연결을 사용할 수 있습니다.
+
+음성 도우미의 Swift 소스를 수정했거나 실행 파일이 없다면 다음 명령으로 다시 빌드할 수 있습니다. Xcode Command Line Tools가 필요합니다.
+
+```bash
+./build_voice_helper.sh
+```
+
+카메라 미리보기는 화면 좌측 하단에 작게 표시되며, 커서는 전체 화면 영역으로 이동합니다.
+
+커서는 상대 이동 방식입니다. 얼굴을 중앙에서 약간 벗어난 위치로 유지하면 해당 방향으로 계속 이동하며, 중앙 근처의 작은 흔들림은 무시합니다. 처음 0.25초는 목표 위치를 정밀하게 맞출 수 있도록 저속으로 움직이고, 같은 방향을 계속 유지하면 이후 0.75초 동안 부드럽게 가속합니다. 얼굴을 중앙으로 되돌리거나 방향을 반대로 바꾸면 가속 상태가 즉시 초기화됩니다. 따라서 짧게 움직이면 미세 조정이 되고, 작은 각도로 고개를 유지하면 화면 끝까지 빠르게 이동할 수 있습니다.
+
+최고 이동 속도는 `--sensitivity`로 조절합니다. 기본값 `1.8`부터 사용하고, 장거리 이동만 과하게 빠르면 값을 조금 낮추세요. `--smoothing`은 속도 변화의 반응성을 조절하며 높을수록 현재 목표 속도에 빠르게 도달합니다.
+
+```bash
+python head_mouse.py --sensitivity 1.8 --smoothing 0.75
+```
+
+## iPhone 카메라를 사용하지 않는 이유
+
+일반적인 OpenCV의 `VideoCapture(0)` 방식은 macOS가 우선순위를 바꾸면 iPhone 연속성 카메라를 열 수 있습니다. 이 프로그램은 OpenCV로 카메라를 열지 않고, macOS AVFoundation에서 `AVCaptureDeviceTypeBuiltInWideAngleCamera`인 장치만 명시적으로 선택합니다. 즉 iPhone/연속성 카메라는 선택 후보가 아닙니다. 내장 카메라를 찾지 못하면 다른 카메라로 대체하지 않고 오류를 표시합니다.
+
+그래도 시스템 전체에서 연속성 카메라를 끄고 싶다면 iPhone의 `설정 → 일반 → AirPlay 및 연속성 → 연속성 카메라`도 끌 수 있습니다.
