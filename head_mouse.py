@@ -20,7 +20,21 @@ import cv2
 import numpy as np
 import objc
 import pyautogui
-from AppKit import NSRunningApplication
+from AppKit import (
+    NSBackingStoreBuffered,
+    NSColor,
+    NSFloatingWindowLevel,
+    NSImage,
+    NSImageScaleProportionallyUpOrDown,
+    NSImageView,
+    NSPanel,
+    NSRunningApplication,
+    NSScreen,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowStyleMaskBorderless,
+    NSWindowStyleMaskNonactivatingPanel,
+)
 from AVFoundation import (
     AVCaptureDevice,
     AVCaptureDeviceInput,
@@ -62,7 +76,6 @@ class BuiltInCameraNotFound(RuntimeError):
     """Raised rather than silently opening a Continuity/iPhone camera."""
 
 
-GUIDE_WINDOW_TITLE = "Head Mouse - Motion Guide"
 GUIDE_WIDTH = 480
 GUIDE_HEIGHT = 390
 
@@ -84,7 +97,9 @@ def _guide_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 
 def create_motion_guide() -> np.ndarray:
     """Create the Korean quick-reference panel shown at the bottom-right."""
-    canvas = Image.new("RGB", (GUIDE_WIDTH, GUIDE_HEIGHT), (22, 25, 32))
+    # Transparent pixels outside the rounded card make the native borderless
+    # panel look like a true overlay instead of a separate application window.
+    canvas = Image.new("RGBA", (GUIDE_WIDTH, GUIDE_HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     title_font = _guide_font(22)
     label_font = _guide_font(16)
@@ -92,7 +107,8 @@ def create_motion_guide() -> np.ndarray:
     footer_font = _guide_font(14)
 
     draw.rounded_rectangle((10, 10, GUIDE_WIDTH - 10, GUIDE_HEIGHT - 10),
-                           radius=18, fill=(29, 33, 42), outline=(73, 84, 105), width=2)
+                           radius=18, fill=(29, 33, 42, 238),
+                           outline=(73, 84, 105, 245), width=2)
     draw.text((24, 20), "얼굴 모션 빠른 안내", font=title_font, fill=(244, 247, 252))
     draw.text((GUIDE_WIDTH - 137, 25), "HEAD MOUSE", font=footer_font,
               fill=(102, 198, 255))
@@ -123,35 +139,64 @@ def create_motion_guide() -> np.ndarray:
               font=footer_font, fill=(255, 215, 110))
     draw.text((273, footer_top + 9), "C  보정   Q  종료",
               font=footer_font, fill=(190, 199, 214))
-    draw.text((31, footer_top + 31), "키 입력 전 미리보기 또는 안내 창을 클릭하세요.",
+    draw.text((31, footer_top + 31), "H 키는 미리보기 창을 클릭한 뒤 누르세요.",
               font=footer_font, fill=(155, 166, 184))
-    return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
+    return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGBA2BGRA)
 
 
-def show_motion_guide(guide_image: np.ndarray, screen_width: int,
-                      screen_height: int) -> None:
-    cv2.namedWindow(GUIDE_WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
-    cv2.imshow(GUIDE_WINDOW_TITLE, guide_image)
-    cv2.moveWindow(
-        GUIDE_WINDOW_TITLE,
-        max(20, screen_width - GUIDE_WIDTH - 20),
-        max(20, screen_height - GUIDE_HEIGHT - 70),
-    )
-    topmost_property = getattr(cv2, "WND_PROP_TOPMOST", None)
-    if topmost_property is not None:
-        try:
-            cv2.setWindowProperty(GUIDE_WINDOW_TITLE, topmost_property, 1)
-        except cv2.error:
-            # Some OpenCV macOS builds do not expose the topmost window flag.
-            pass
+class MotionGuideOverlay:
+    """Borderless, click-through macOS overlay for the gesture quick guide."""
 
+    def __init__(self, guide_image: np.ndarray) -> None:
+        ok, encoded = cv2.imencode(".png", guide_image)
+        if not ok:
+            raise RuntimeError("모션 안내 이미지를 만들지 못했습니다.")
+        payload = encoded.tobytes()
+        data = NSData.dataWithBytes_length_(payload, len(payload))
+        self.image = NSImage.alloc().initWithData_(data)
+        if self.image is None:
+            raise RuntimeError("모션 안내 이미지를 macOS 패널로 변환하지 못했습니다.")
 
-def hide_motion_guide() -> None:
-    try:
-        cv2.destroyWindow(GUIDE_WINDOW_TITLE)
-    except cv2.error:
-        # The user may already have closed the guide with the window button.
-        pass
+        screen = NSScreen.mainScreen()
+        visible_frame = screen.visibleFrame()
+        x = float(visible_frame.origin.x + visible_frame.size.width - GUIDE_WIDTH - 20)
+        y = float(visible_frame.origin.y + 20)
+        frame = ((x, y), (GUIDE_WIDTH, GUIDE_HEIGHT))
+        style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame,
+            style,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.panel.setOpaque_(False)
+        self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setHasShadow_(True)
+        self.panel.setLevel_(NSFloatingWindowLevel)
+        self.panel.setHidesOnDeactivate_(False)
+        self.panel.setIgnoresMouseEvents_(True)
+        self.panel.setReleasedWhenClosed_(False)
+        self.panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+
+        self.image_view = NSImageView.alloc().initWithFrame_(
+            ((0.0, 0.0), (GUIDE_WIDTH, GUIDE_HEIGHT))
+        )
+        self.image_view.setImage_(self.image)
+        self.image_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        self.panel.setContentView_(self.image_view)
+
+    def show(self) -> None:
+        self.panel.orderFrontRegardless()
+
+    def hide(self) -> None:
+        self.panel.orderOut_(None)
+
+    def close(self) -> None:
+        self.panel.orderOut_(None)
+        self.panel.close()
 
 
 def find_builtin_camera():
@@ -896,10 +941,10 @@ def main() -> int:
     cv2.resizeWindow(preview_title, preview_width, preview_height)
     # OpenCV uses the same top-left screen coordinate convention as pyautogui.
     cv2.moveWindow(preview_title, 20, max(20, screen_height - preview_height - 70))
-    guide_image = create_motion_guide()
+    guide_overlay = MotionGuideOverlay(create_motion_guide())
     guide_visible = not args.hide_guide
     if guide_visible:
-        show_motion_guide(guide_image, screen_width, screen_height)
+        guide_overlay.show()
     print(f"사용 카메라: {camera.name} (MacBook 내장 카메라 전용)")
     print("양쪽 눈을 빠르게 세 번 깜빡임: 좌클릭")
     print("입 벌리기 0.7초: 스크롤 모드 | 양쪽 눈썹 0.5초: 드래그 토글")
@@ -1019,10 +1064,10 @@ def main() -> int:
             if key in (ord("h"), ord("H")):
                 guide_visible = not guide_visible
                 if guide_visible:
-                    show_motion_guide(guide_image, screen_width, screen_height)
+                    guide_overlay.show()
                     print("모션 안내 표시")
                 else:
-                    hide_motion_guide()
+                    guide_overlay.hide()
                     print("모션 안내 숨김")
             if key in (ord("c"), ord("C")) and last_gesture_frame is not None:
                 voice.cancel()
@@ -1033,7 +1078,7 @@ def main() -> int:
         voice.cancel()
         gestures.release_drag("프로그램 종료")
         camera.close()
-        hide_motion_guide()
+        guide_overlay.close()
         cv2.destroyAllWindows()
     return 0
 
