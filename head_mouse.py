@@ -64,6 +64,9 @@ from Foundation import NSData, NSObject
 from PIL import Image, ImageDraw, ImageFont
 import dispatch
 
+from nearby_action_agent import NearbyActionAgent
+from visual_action_agent import VisualActionAgent
+
 try:
     from Vision import VNDetectFaceLandmarksRequest, VNImageRequestHandler
     VISION_IMPORT_ERROR = None
@@ -78,6 +81,8 @@ class BuiltInCameraNotFound(RuntimeError):
 
 GUIDE_WIDTH = 480
 GUIDE_HEIGHT = 390
+STATUS_WIDTH = 390
+STATUS_HEIGHT = 88
 
 
 def _guide_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -120,7 +125,7 @@ def create_motion_guide() -> np.ndarray:
         ("스크롤 모드", "입을 벌리고 0.7초 유지"),
         ("스크롤", "모드에서 고개를 위·아래로 움직이기"),
         ("드래그", "양쪽 눈썹을 0.5초 올려 켜기/끄기"),
-        ("음성 입력", "입 다문 넓은 미소를 2초 유지"),
+        ("음성 / AI", "입 다문 넓은 미소 2초 후 말하기"),
     )
     row_top = 68
     row_height = 42
@@ -141,6 +146,52 @@ def create_motion_guide() -> np.ndarray:
               font=footer_font, fill=(190, 199, 214))
     draw.text((31, footer_top + 31), "H 키는 미리보기 창을 클릭한 뒤 누르세요.",
               font=footer_font, fill=(155, 166, 184))
+    return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGBA2BGRA)
+
+
+def create_mode_status(mode: str) -> np.ndarray:
+    """Render a compact top-left overlay for an active interaction mode."""
+    canvas = Image.new("RGBA", (STATUS_WIDTH, STATUS_HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    title_font = _guide_font(18)
+    detail_font = _guide_font(14)
+    symbol_font = _guide_font(25)
+
+    if mode == "visual":
+        accent = (183, 132, 255, 255)
+        title = "로컬 AI 화면 분석 중"
+        detail = "커서 주변에서 클릭 대상을 찾는 중"
+        symbol = "AI"
+    elif mode == "voice":
+        accent = (94, 174, 255, 255)
+        title = "음성 인식 모드 활성화"
+        detail = "말씀하세요 · 얼굴 제스처는 잠시 멈춤"
+        symbol = "●"
+    else:
+        accent = (255, 174, 67, 255)
+        title = "스크롤 모드 활성화"
+        detail = "고개를 위·아래로 움직여 스크롤"
+        symbol = "↕"
+
+    draw.rounded_rectangle(
+        (7, 7, STATUS_WIDTH - 7, STATUS_HEIGHT - 7),
+        radius=18,
+        fill=(28, 32, 41, 235),
+        outline=accent,
+        width=2,
+    )
+    draw.ellipse((20, 20, 68, 68), fill=(40, 47, 60, 250), outline=accent, width=2)
+    symbol_box = draw.textbbox((0, 0), symbol, font=symbol_font)
+    symbol_width = symbol_box[2] - symbol_box[0]
+    symbol_height = symbol_box[3] - symbol_box[1]
+    draw.text(
+        (44 - symbol_width / 2, 44 - symbol_height / 2 - symbol_box[1]),
+        symbol,
+        font=symbol_font,
+        fill=accent,
+    )
+    draw.text((82, 19), title, font=title_font, fill=(244, 247, 252, 255))
+    draw.text((82, 49), detail, font=detail_font, fill=(176, 187, 204, 255))
     return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGBA2BGRA)
 
 
@@ -193,6 +244,79 @@ class MotionGuideOverlay:
 
     def hide(self) -> None:
         self.panel.orderOut_(None)
+
+    def close(self) -> None:
+        self.panel.orderOut_(None)
+        self.panel.close()
+
+
+class ModeStatusOverlay:
+    """Dynamic, borderless macOS overlay for active interaction states."""
+
+    def __init__(self) -> None:
+        screen = NSScreen.mainScreen()
+        visible_frame = screen.visibleFrame()
+        x = float(visible_frame.origin.x + 20)
+        y = float(
+            visible_frame.origin.y + visible_frame.size.height - STATUS_HEIGHT - 20
+        )
+        frame = ((x, y), (STATUS_WIDTH, STATUS_HEIGHT))
+        style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame,
+            style,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.panel.setOpaque_(False)
+        self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setHasShadow_(True)
+        self.panel.setLevel_(NSFloatingWindowLevel)
+        self.panel.setHidesOnDeactivate_(False)
+        self.panel.setIgnoresMouseEvents_(True)
+        self.panel.setReleasedWhenClosed_(False)
+        self.panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+
+        self.image_view = NSImageView.alloc().initWithFrame_(
+            ((0.0, 0.0), (STATUS_WIDTH, STATUS_HEIGHT))
+        )
+        self.image_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        self.panel.setContentView_(self.image_view)
+        self.image: Optional[NSImage] = None
+        self.mode: Optional[str] = None
+
+    def _set_image(self, image: np.ndarray) -> None:
+        ok, encoded = cv2.imencode(".png", image)
+        if not ok:
+            raise RuntimeError("모드 상태 이미지를 만들지 못했습니다.")
+        payload = encoded.tobytes()
+        data = NSData.dataWithBytes_length_(payload, len(payload))
+        self.image = NSImage.alloc().initWithData_(data)
+        if self.image is None:
+            raise RuntimeError("모드 상태 이미지를 macOS 패널로 변환하지 못했습니다.")
+        self.image_view.setImage_(self.image)
+
+    def update(
+        self,
+        scroll_active: bool,
+        voice_active: bool,
+        visual_active: bool = False,
+    ) -> None:
+        new_mode = (
+            "visual" if visual_active
+            else ("voice" if voice_active else ("scroll" if scroll_active else None))
+        )
+        if new_mode == self.mode:
+            return
+        self.mode = new_mode
+        if new_mode is None:
+            self.panel.orderOut_(None)
+            return
+        self._set_image(create_mode_status(new_mode))
+        self.panel.orderFrontRegardless()
 
     def close(self) -> None:
         self.panel.orderOut_(None)
@@ -809,6 +933,11 @@ class CursorController:
             self.motion_direction.fill(0.0)
         self.last_time = time.monotonic()
 
+    def sync_to_system_cursor(self) -> None:
+        """Keep relative movement continuous after an external AI click."""
+        self.cursor = np.array(pyautogui.position(), dtype=float)
+        self.stop()
+
     def move(self, tracking_point: np.ndarray) -> None:
         if self.center is None:
             self.calibrate(tracking_point)
@@ -896,6 +1025,12 @@ def parse_args() -> argparse.Namespace:
                         help="음성 인식 언어 코드 (기본값: ko-KR)")
     parser.add_argument("--hide-guide", action="store_true",
                         help="시작할 때 우측 하단 모션 안내를 숨김")
+    parser.add_argument("--visual-model", default="qwen2.5vl:3b",
+                        help="로컬 Ollama 비전 모델 (기본값: qwen2.5vl:3b)")
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434",
+                        help="이 Mac에서 실행되는 Ollama 주소")
+    parser.add_argument("--no-visual-agent", action="store_true",
+                        help="접근성 분석 실패 시 로컬 화면 AI 폴백을 사용하지 않음")
     return parser.parse_args()
 
 
@@ -931,9 +1066,22 @@ def main() -> int:
         print(f"음성 입력 초기화 오류: {exc}", file=sys.stderr)
         camera.close()
         return 1
+    try:
+        nearby_agent = NearbyActionAgent()
+    except (OSError, RuntimeError) as exc:
+        print(f"AI 액션 초기화 오류: {exc}", file=sys.stderr)
+        voice.cancel()
+        camera.close()
+        return 1
+    visual_agent = VisualActionAgent(
+        model=args.visual_model,
+        base_url=args.ollama_url,
+        enabled=not args.no_visual_agent,
+    )
     gestures = GestureController()
     event_text = ""
     event_display_until = 0.0
+    cursor_resume_at = 0.0
     last_gesture_frame: Optional[FaceGestureFrame] = None
     preview_title = "Head Mouse - C: calibrate, H: guide, Q: quit"
     preview_width, preview_height = 320, 240
@@ -942,6 +1090,7 @@ def main() -> int:
     # OpenCV uses the same top-left screen coordinate convention as pyautogui.
     cv2.moveWindow(preview_title, 20, max(20, screen_height - preview_height - 70))
     guide_overlay = MotionGuideOverlay(create_motion_guide())
+    mode_status_overlay = ModeStatusOverlay()
     guide_visible = not args.hide_guide
     if guide_visible:
         guide_overlay.show()
@@ -949,12 +1098,20 @@ def main() -> int:
     print("양쪽 눈을 빠르게 세 번 깜빡임: 좌클릭")
     print("입 벌리기 0.7초: 스크롤 모드 | 양쪽 눈썹 0.5초: 드래그 토글")
     print("넓게 미소 짓기 2초: 음성 입력 시작")
+    print("음성 AI 액션 예시: '메모장 켜줘' | '이 버튼 눌러줘'")
+    visual_ready, visual_status = visual_agent.status()
+    print(f"로컬 화면 AI: {visual_status}")
+    if visual_ready:
+        _warmup_started, warmup_message = visual_agent.warm_up_async()
+        print(warmup_message)
+    elif not args.no_visual_agent:
+        print("로컬 화면 AI를 설치하지 않아도 기존 접근성 기반 액션은 계속 동작합니다.")
     permission_message = voice.permission_message()
     if permission_message:
         print(f"음성 입력 권한: {permission_message}")
     print("H: 모션 안내 켜기/끄기 | C: 보정 | Q 또는 Esc: 종료")
-    camera.start()
     try:
+        camera.start()
         while True:
             frame = camera.read()
             if frame is None:
@@ -964,39 +1121,192 @@ def main() -> int:
             gesture_frame = gesture_analyzer.analyze(raw_image)
             image = cv2.flip(raw_image, 1)
             now = time.monotonic()
+            visual_result_handled = False
+            warmup_message = visual_agent.poll_warmup()
+            if warmup_message:
+                print(warmup_message)
             dictation_result = voice.poll(now)
             if dictation_result is not None:
                 recognized_text, recognition_error = dictation_result
                 gestures.voice_finished(now)
                 if recognized_text:
-                    type_unicode_text(recognized_text)
-                    print(f"음성 입력 완료: {recognized_text}")
-                    event_text = "DICTATION DONE"
+                    agent_result = nearby_agent.handle(recognized_text)
+                    if agent_result.is_command:
+                        accessibility_candidates = list(
+                            nearby_agent.last_resolution_candidates
+                        )
+                        print(f"AI 명령 분석 앱: {nearby_agent.last_frontmost}")
+                        print(f"AI 웹 접근성: {nearby_agent.last_web_accessibility}")
+                        if accessibility_candidates:
+                            resolved_labels = ", ".join(
+                                label[:55]
+                                for label in accessibility_candidates[:8]
+                            )
+                            print(f"AI 명령 시점 후보: {resolved_labels}")
+                        if agent_result.success:
+                            visual_agent.cancel()
+                            print(f"AI 액션 완료: {agent_result.message}")
+                            event_text = "AI ACTION DONE"
+                        elif agent_result.blocked:
+                            visual_agent.cancel()
+                            print(
+                                f"AI 액션 차단: {agent_result.message}",
+                                file=sys.stderr,
+                            )
+                            event_text = "AI ACTION BLOCKED"
+                        else:
+                            print(
+                                f"접근성 AI 액션 실패: {agent_result.message}"
+                            )
+                            # Capture at command time so the visual model never
+                            # acts on a screenshot that became stale while the
+                            # user was speaking. Hide our transient status card
+                            # before taking the screenshot.
+                            mode_status_overlay.update(False, False, False)
+                            cursor_position = pyautogui.position()
+                            if guide_visible:
+                                guide_overlay.hide()
+                            try:
+                                captured, capture_message = visual_agent.prepare_capture(
+                                    (
+                                        float(cursor_position.x),
+                                        float(cursor_position.y),
+                                    ),
+                                    (screen_width, screen_height),
+                                )
+                            finally:
+                                if guide_visible:
+                                    guide_overlay.show()
+                            if captured:
+                                print(f"로컬 화면 캡처: {capture_message}")
+                                started, visual_message = visual_agent.start(
+                                    recognized_text,
+                                    accessibility_candidates,
+                                    target_text=agent_result.target,
+                                )
+                            else:
+                                started = False
+                                visual_message = capture_message
+                            if started:
+                                print(visual_message)
+                                event_text = "LOCAL AI ANALYZING"
+                            else:
+                                print(
+                                    f"AI 액션 실패: {agent_result.message} / "
+                                    f"{visual_message}",
+                                    file=sys.stderr,
+                                )
+                                event_text = "AI ACTION ERROR"
+                    else:
+                        visual_agent.cancel()
+                        type_unicode_text(recognized_text)
+                        print(f"음성 입력 완료: {recognized_text}")
+                        event_text = "DICTATION DONE"
                 else:
+                    visual_agent.cancel()
+                    nearby_agent.clear()
                     print(f"음성 입력 실패: {recognition_error}", file=sys.stderr)
                     event_text = "VOICE ERROR"
                 event_display_until = now + 1.5
+
+            visual_result = visual_agent.poll()
+            if visual_result is not None:
+                visual_result_handled = True
+                gestures.voice_finished(now)
+                if (
+                    visual_result.success
+                    and visual_result.global_x is not None
+                    and visual_result.global_y is not None
+                ):
+                    mode_status_overlay.update(False, False, False)
+                    current_cursor = pyautogui.position()
+                    if guide_visible:
+                        guide_overlay.hide()
+                    try:
+                        try:
+                            verified, verification_message = visual_agent.verify_result(
+                                visual_result,
+                                (float(current_cursor.x), float(current_cursor.y)),
+                            )
+                        except Exception as exc:
+                            verified = False
+                            verification_message = f"클릭 직전 검증 오류: {exc}"
+                    finally:
+                        if guide_visible:
+                            guide_overlay.show()
+                    if verified:
+                        click_x = int(round(visual_result.global_x))
+                        click_y = int(round(visual_result.global_y))
+                        pyautogui.click(
+                            x=click_x,
+                            y=click_y,
+                            button="left",
+                            _pause=False,
+                        )
+                        controller.sync_to_system_cursor()
+                        cursor_resume_at = now + 0.35
+                        print(
+                            f"로컬 AI 액션 완료: {visual_result.message} "
+                            f"({click_x}, {click_y}) | {verification_message}"
+                        )
+                        event_text = "LOCAL AI CLICK"
+                    else:
+                        print(
+                            f"로컬 AI 클릭 취소: {verification_message}",
+                            file=sys.stderr,
+                        )
+                        event_text = "LOCAL AI CANCELLED"
+                else:
+                    print(
+                        f"로컬 AI 액션 실패: {visual_result.message}",
+                        file=sys.stderr,
+                    )
+                    event_text = "LOCAL AI ERROR"
+                event_display_until = now + 1.8
             if gesture_frame is not None:
                 last_gesture_frame = gesture_frame
                 was_scroll_mode = gestures.scroll_mode
-                if voice.listening:
-                    # Dictation takes exclusive control of facial gestures.
-                    # Speaking can open the mouth, so keep scroll mode off and
-                    # do not run any click, drag, or scroll gesture detectors.
+                if voice.listening or visual_agent.busy or visual_result_handled:
+                    # Dictation and visual grounding take exclusive control of
+                    # facial gestures. Speaking can open the mouth, and head
+                    # movement during inference must not displace the target.
                     gestures.scroll_mode = False
                     gestures.scroll_anchor_y = None
                     events = []
                 else:
                     events = gestures.update(gesture_frame, now)
                 if "VOICE START" in events:
+                    cursor_position = pyautogui.position()
+                    candidate_count = nearby_agent.capture(
+                        (float(cursor_position.x), float(cursor_position.y))
+                    )
+                    if nearby_agent.last_error:
+                        print(f"AI 주변 요소 분석: {nearby_agent.last_error}", file=sys.stderr)
+                    else:
+                        print(f"AI 주변 요소 분석 완료: {candidate_count}개")
+                        print(f"AI 분석 대상 앱: {nearby_agent.last_frontmost}")
+                        print(f"AI 웹 접근성: {nearby_agent.last_web_accessibility}")
+                        if nearby_agent.elements:
+                            nearby_labels = ", ".join(
+                                f"{candidate.label[:45]} ({candidate.distance:.0f}px)"
+                                for candidate in nearby_agent.elements[:8]
+                            )
+                            print(f"AI 주변 후보: {nearby_labels}")
                     started, message = voice.start()
                     if started:
                         events = ["LISTENING"]
                     else:
+                        visual_agent.cancel()
+                        nearby_agent.clear()
                         print(f"음성 입력 시작 실패: {message}", file=sys.stderr)
                         gestures.voice_finished(now)
                         events = ["VOICE ERROR"]
-                if voice.listening:
+                if (
+                    voice.listening
+                    or visual_agent.busy
+                    or visual_result_handled
+                    or now < cursor_resume_at
+                ):
                     controller.stop()
                 elif gestures.scroll_mode:
                     controller.stop()
@@ -1053,9 +1363,19 @@ def main() -> int:
                               (255, 120, 0), 8)
                 cv2.putText(image, "LISTENING...", (12, 180), cv2.FONT_HERSHEY_SIMPLEX,
                             0.80, (255, 120, 0), 2)
+            if visual_agent.busy:
+                cv2.rectangle(image, (4, 4), (image.shape[1] - 5, image.shape[0] - 5),
+                              (255, 120, 210), 8)
+                cv2.putText(image, "LOCAL AI ANALYZING...", (12, 210),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 120, 210), 2)
             if now < event_display_until:
                 cv2.putText(image, event_text, (12, 150), cv2.FONT_HERSHEY_SIMPLEX,
                             0.8, (255, 255, 0), 2)
+            mode_status_overlay.update(
+                gestures.scroll_mode,
+                voice.listening,
+                visual_agent.busy,
+            )
             preview = cv2.resize(image, (preview_width, preview_height), interpolation=cv2.INTER_AREA)
             cv2.imshow(preview_title, preview)
             key = cv2.waitKey(1) & 0xFF
@@ -1071,14 +1391,19 @@ def main() -> int:
                     print("모션 안내 숨김")
             if key in (ord("c"), ord("C")) and last_gesture_frame is not None:
                 voice.cancel()
+                visual_agent.cancel()
+                nearby_agent.clear()
                 controller.calibrate(last_gesture_frame.control_point)
                 gestures.calibrate()
                 print("커서 및 얼굴 제스처 재보정 시작")
     finally:
         voice.cancel()
+        visual_agent.close()
+        nearby_agent.close()
         gestures.release_drag("프로그램 종료")
         camera.close()
         guide_overlay.close()
+        mode_status_overlay.close()
         cv2.destroyAllWindows()
     return 0
 
